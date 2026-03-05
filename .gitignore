@@ -1,0 +1,92 @@
+# =========================
+# ESP-IDF
+# =========================
+# Build directory
+build/
+.cache/
+
+# SDK configuration old backups
+sdkconfig.old
+
+# Component manager downloaded components
+managed_components/
+
+# Visual setup (e.g. from idf.py menuconfig)
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# If you prefer to track sdkconfig, leave it un-commented.
+# Some teams prefer to use sdkconfig.defaults and ignore sdkconfig:
+# sdkconfig
+
+# =========================
+# VSCode (.vscode/)
+# =========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/c_cpp_properties.json
+*.code-workspace
+
+# Local History for Visual Studio Code
+.history/
+
+# =========================
+# Linux / macOS
+# =========================
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# =========================
+# C/C++ (General)
+# =========================
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+*.bin
+
+# =========================
+# IDEs and Editors
+# =========================
+*.swp
+*.~
+*.swo
+*.swn
+.idea/
+*.sublime-project
+*.sublime-workspace
