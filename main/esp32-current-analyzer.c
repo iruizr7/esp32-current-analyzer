@@ -21,6 +21,7 @@
 
 #define INA219_ADDR_1 0x40
 #define INA219_ADDR_2 0x41
+#define MAX17048_ADDR 0x36
 
 #define INA219_REG_CONFIG 0x00
 #define INA219_REG_CURRENT 0x04
@@ -33,6 +34,12 @@
 #define OLED_REFRESH_INTERVAL_US 500000
 #define INA219_SAMPLE_INTERVAL_US 1100
 #define EMAH_EMIT_STEP 0.01f
+#define MAX17048_REG_VCELL 0x02
+#define MAX17048_REG_SOC 0x04
+#define MAX17048_SAMPLE_INTERVAL_US 100000
+#define MAX17048_RETRY_INTERVAL_US 1000000
+#define MAX17048_INIT_RETRIES 8
+#define MAX17048_INIT_RETRY_DELAY_MS 50
 
 #define SSD1306_WIDTH 128
 #define SSD1306_HEIGHT 64
@@ -61,10 +68,34 @@ typedef struct {
     bool has_emitted_total;
 } ina219_sensor_t;
 
+typedef struct {
+    uint8_t address;
+    i2c_master_dev_handle_t dev;
+    bool present;
+    bool has_sample;
+    float voltage_v;
+    float soc_percent;
+    int64_t last_sample_us;
+    int64_t last_retry_us;
+} max17048_gauge_t;
+
 static ina219_sensor_t s_sensors[] = {
     {.address = INA219_ADDR_1, .label = INA1_PREFIX, .dev = NULL, .present = false, .has_sample = false, .current_ma = 0.0f, .total_mah = 0.0f, .last_sample_us = 0, .last_emit_current_ma = 0.0f, .last_emit_total_mah = 0.0f, .has_emitted_current = false, .has_emitted_total = false},
     {.address = INA219_ADDR_2, .label = INA2_PREFIX, .dev = NULL, .present = false, .has_sample = false, .current_ma = 0.0f, .total_mah = 0.0f, .last_sample_us = 0, .last_emit_current_ma = 0.0f, .last_emit_total_mah = 0.0f, .has_emitted_current = false, .has_emitted_total = false},
 };
+static max17048_gauge_t s_battery = {
+    .address = MAX17048_ADDR,
+    .dev = NULL,
+    .present = false,
+    .has_sample = false,
+    .voltage_v = 0.0f,
+    .soc_percent = 0.0f,
+    .last_sample_us = 0,
+    .last_retry_us = 0,
+};
+
+static esp_err_t max17048_read_voltage_v(max17048_gauge_t *gauge, float *voltage_v);
+static esp_err_t max17048_read_soc_percent(max17048_gauge_t *gauge, float *soc_percent);
 
 static esp_err_t i2c_master_init(void)
 {
@@ -161,6 +192,100 @@ static bool ina219_sample_update(ina219_sensor_t *sensor, int64_t now_us)
     return true;
 }
 
+static esp_err_t max17048_read_reg(max17048_gauge_t *gauge, uint8_t reg, uint16_t *value)
+{
+    uint8_t rx[2] = {0};
+    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(gauge->dev, &reg, 1, rx, sizeof(rx), 50), TAG, "max17048 read reg 0x%02X failed", reg);
+    *value = (uint16_t)((rx[0] << 8) | rx[1]);
+    return ESP_OK;
+}
+
+static esp_err_t max17048_init(max17048_gauge_t *gauge)
+{
+    if (gauge->dev != NULL) {
+        i2c_master_bus_rm_device(gauge->dev);
+        gauge->dev = NULL;
+    }
+
+    ESP_RETURN_ON_ERROR(i2c_attach_device(gauge->address, &gauge->dev), TAG, "max17048 attach failed");
+
+    for (int i = 0; i < MAX17048_INIT_RETRIES; i++) {
+        float voltage_v = 0.0f;
+        float soc_percent = 0.0f;
+        if (max17048_read_voltage_v(gauge, &voltage_v) == ESP_OK &&
+            max17048_read_soc_percent(gauge, &soc_percent) == ESP_OK) {
+            gauge->voltage_v = voltage_v;
+            gauge->soc_percent = soc_percent;
+            gauge->has_sample = true;
+            gauge->present = true;
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(MAX17048_INIT_RETRY_DELAY_MS));
+    }
+
+    i2c_master_bus_rm_device(gauge->dev);
+    gauge->dev = NULL;
+    gauge->present = false;
+    gauge->has_sample = false;
+    return ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t max17048_read_voltage_v(max17048_gauge_t *gauge, float *voltage_v)
+{
+    uint16_t raw = 0;
+    ESP_RETURN_ON_ERROR(max17048_read_reg(gauge, MAX17048_REG_VCELL, &raw), TAG, "max17048 vcell read failed");
+    *voltage_v = (float)raw * 0.000078125f;
+    return ESP_OK;
+}
+
+static esp_err_t max17048_read_soc_percent(max17048_gauge_t *gauge, float *soc_percent)
+{
+    uint16_t raw = 0;
+    ESP_RETURN_ON_ERROR(max17048_read_reg(gauge, MAX17048_REG_SOC, &raw), TAG, "max17048 soc read failed");
+    *soc_percent = (float)raw / 256.0f;
+    return ESP_OK;
+}
+
+static bool max17048_sample_update(max17048_gauge_t *gauge, int64_t now_us)
+{
+    if (!gauge->present) {
+        return false;
+    }
+    if (gauge->last_sample_us != 0 && (now_us - gauge->last_sample_us) < MAX17048_SAMPLE_INTERVAL_US) {
+        return false;
+    }
+
+    float voltage_v = 0.0f;
+    float soc_percent = 0.0f;
+    if (max17048_read_voltage_v(gauge, &voltage_v) != ESP_OK) {
+        return false;
+    }
+    if (max17048_read_soc_percent(gauge, &soc_percent) != ESP_OK) {
+        return false;
+    }
+
+    gauge->voltage_v = voltage_v;
+    gauge->soc_percent = soc_percent;
+    gauge->has_sample = true;
+    gauge->last_sample_us = now_us;
+    return true;
+}
+
+static void max17048_retry_if_needed(max17048_gauge_t *gauge, int64_t now_us)
+{
+    if (gauge->present) {
+        return;
+    }
+    if (gauge->last_retry_us != 0 && (now_us - gauge->last_retry_us) < MAX17048_RETRY_INTERVAL_US) {
+        return;
+    }
+
+    gauge->last_retry_us = now_us;
+    if (max17048_init(gauge) == ESP_OK) {
+        ESP_LOGI(TAG, "max17048 ready at 0x%02X", gauge->address);
+    }
+}
+
 static esp_err_t ssd1306_send_cmd(uint8_t cmd)
 {
     const uint8_t tx[2] = {0x00, cmd};
@@ -254,13 +379,20 @@ static void font5x7_get(char c, uint8_t out[5])
     case 'N': out[0] = 0x7F; out[1] = 0x04; out[2] = 0x08; out[3] = 0x10; out[4] = 0x7F; break;
     case 'R': out[0] = 0x7F; out[1] = 0x09; out[2] = 0x19; out[3] = 0x29; out[4] = 0x46; break;
     case 'T': out[0] = 0x01; out[1] = 0x01; out[2] = 0x7F; out[3] = 0x01; out[4] = 0x01; break;
+    case 'V': out[0] = 0x1F; out[1] = 0x20; out[2] = 0x40; out[3] = 0x20; out[4] = 0x1F; break;
     case 'a': out[0] = 0x20; out[1] = 0x54; out[2] = 0x54; out[3] = 0x54; out[4] = 0x78; break;
+    case 'b': out[0] = 0x7F; out[1] = 0x48; out[2] = 0x44; out[3] = 0x44; out[4] = 0x38; break;
+    case 'c': out[0] = 0x38; out[1] = 0x44; out[2] = 0x44; out[3] = 0x44; out[4] = 0x28; break;
     case 'h': out[0] = 0x7F; out[1] = 0x08; out[2] = 0x04; out[3] = 0x04; out[4] = 0x78; break;
     case 'i': out[0] = 0x00; out[1] = 0x44; out[2] = 0x7D; out[3] = 0x40; out[4] = 0x00; break;
     case 'm': out[0] = 0x7C; out[1] = 0x04; out[2] = 0x18; out[3] = 0x04; out[4] = 0x78; break;
     case 'n': out[0] = 0x7C; out[1] = 0x04; out[2] = 0x04; out[3] = 0x04; out[4] = 0x78; break;
+    case 'o': out[0] = 0x38; out[1] = 0x44; out[2] = 0x44; out[3] = 0x44; out[4] = 0x38; break;
+    case 's': out[0] = 0x48; out[1] = 0x54; out[2] = 0x54; out[3] = 0x54; out[4] = 0x24; break;
+    case 't': out[0] = 0x04; out[1] = 0x04; out[2] = 0x3F; out[3] = 0x44; out[4] = 0x24; break;
     case ':': out[0] = 0x00; out[1] = 0x36; out[2] = 0x36; out[3] = 0x00; out[4] = 0x00; break;
     case '.': out[0] = 0x00; out[1] = 0x60; out[2] = 0x60; out[3] = 0x00; out[4] = 0x00; break;
+    case '%': out[0] = 0x43; out[1] = 0x33; out[2] = 0x08; out[3] = 0x66; out[4] = 0x61; break;
     case '-': out[0] = 0x08; out[1] = 0x08; out[2] = 0x08; out[3] = 0x08; out[4] = 0x08; break;
     case ' ': out[0] = 0x00; out[1] = 0x00; out[2] = 0x00; out[3] = 0x00; out[4] = 0x00; break;
     default:  out[0] = 0x00; out[1] = 0x00; out[2] = 0x5F; out[3] = 0x00; out[4] = 0x00; break;
@@ -324,6 +456,15 @@ static void print_teleplot_total(const ina219_sensor_t *sensor)
     }
 }
 
+static void format_line_battery(char *buf, size_t len, bool ok, float voltage_v, float soc_percent)
+{
+    if (ok) {
+        snprintf(buf, len, "bat:%.2fV soc:%.1f%%", voltage_v, soc_percent);
+    } else {
+        snprintf(buf, len, "bat: ERR soc: ERR");
+    }
+}
+
 void app_main(void)
 {
     bool oled_ok = false;
@@ -331,6 +472,7 @@ void app_main(void)
     char line2[24] = {0};
     char line3[24] = {0};
     char line4[24] = {0};
+    char line5[24] = {0};
     int64_t next_oled_update_us = 0;
 
     ESP_ERROR_CHECK(i2c_master_init());
@@ -343,6 +485,11 @@ void app_main(void)
             ESP_LOGW(TAG, "%s missing at 0x%02X", s_sensors[i].label, s_sensors[i].address);
         }
     }
+    if (max17048_init(&s_battery) == ESP_OK) {
+        ESP_LOGI(TAG, "max17048 ready at 0x%02X", s_battery.address);
+    } else {
+        ESP_LOGW(TAG, "max17048 missing at 0x%02X", s_battery.address);
+    }
 
     if (ssd1306_detect_and_init() == ESP_OK) {
         oled_ok = true;
@@ -353,6 +500,8 @@ void app_main(void)
 
     while (true) {
         int64_t now = esp_timer_get_time();
+        max17048_retry_if_needed(&s_battery, now);
+
         bool sampled_any = false;
         bool emit1_current = false;
         bool emit1_total = false;
@@ -361,7 +510,8 @@ void app_main(void)
 
         bool s1 = ina219_sample_update(&s_sensors[0], now);
         bool s2 = ina219_sample_update(&s_sensors[1], now);
-        sampled_any = s1 || s2;
+        bool sb = max17048_sample_update(&s_battery, now);
+        sampled_any = s1 || s2 || sb;
 
         if (s1) {
             if (!s_sensors[0].has_emitted_current ||
@@ -406,12 +556,14 @@ void app_main(void)
             format_line_mah(line2, sizeof(line2), INA1_PREFIX, s_sensors[0].has_sample, s_sensors[0].total_mah);
             format_line_ma(line3, sizeof(line3), INA2_PREFIX, s_sensors[1].has_sample, s_sensors[1].current_ma);
             format_line_mah(line4, sizeof(line4), INA2_PREFIX, s_sensors[1].has_sample, s_sensors[1].total_mah);
+            format_line_battery(line5, sizeof(line5), s_battery.has_sample, s_battery.voltage_v, s_battery.soc_percent);
 
             memset(s_fb, 0, sizeof(s_fb));
             fb_draw_text(0, 0, line1);
             fb_draw_text(0, 14, line2);
             fb_draw_text(0, 28, line3);
             fb_draw_text(0, 42, line4);
+            fb_draw_text(0, 56, line5);
             if (ssd1306_refresh_pages(0, SSD1306_PAGES - 1) != ESP_OK) {
                 oled_ok = false;
                 ESP_LOGW(TAG, "fallo escribiendo OLED, continuo solo por serie");
