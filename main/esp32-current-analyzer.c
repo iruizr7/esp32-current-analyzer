@@ -36,6 +36,15 @@
 #define EMAH_EMIT_STEP 0.01f
 #define MAX17048_REG_VCELL 0x02
 #define MAX17048_REG_SOC 0x04
+#define MAX17048_REG_CRATE 0x16
+#define MAX17048_REG_STATUS 0x1A
+#define MAX17048_CRATE_LSB_PERCENT_PER_HOUR 0.208f
+#define MAX17048_STATUS_SC 0x20
+#define MAX17048_STATUS_SL 0x10
+#define MAX17048_STATUS_VR 0x08
+#define MAX17048_STATUS_VL 0x04
+#define MAX17048_STATUS_VH 0x02
+#define MAX17048_STATUS_RI 0x01
 #define MAX17048_SAMPLE_INTERVAL_US 100000
 #define MAX17048_RETRY_INTERVAL_US 1000000
 #define MAX17048_INIT_RETRIES 8
@@ -46,6 +55,9 @@
 #define SSD1306_PAGES (SSD1306_HEIGHT / 8)
 #define SSD1306_ADDR_1 0x3C
 #define SSD1306_ADDR_2 0x3D
+#define OLED_LINE_STEP 10
+#define INA_VALUE_X 60
+#define INA_UNIT_X 110
 
 static const char *TAG = "ina219-oled";
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -75,6 +87,8 @@ typedef struct {
     bool has_sample;
     float voltage_v;
     float soc_percent;
+    float crate_percent_per_hour;
+    uint16_t status_raw;
     int64_t last_sample_us;
     int64_t last_retry_us;
 } max17048_gauge_t;
@@ -90,12 +104,16 @@ static max17048_gauge_t s_battery = {
     .has_sample = false,
     .voltage_v = 0.0f,
     .soc_percent = 0.0f,
+    .crate_percent_per_hour = 0.0f,
+    .status_raw = 0,
     .last_sample_us = 0,
     .last_retry_us = 0,
 };
 
 static esp_err_t max17048_read_voltage_v(max17048_gauge_t *gauge, float *voltage_v);
 static esp_err_t max17048_read_soc_percent(max17048_gauge_t *gauge, float *soc_percent);
+static esp_err_t max17048_read_crate_percent_per_hour(max17048_gauge_t *gauge, float *crate_percent_per_hour);
+static esp_err_t max17048_read_status_raw(max17048_gauge_t *gauge, uint16_t *status_raw);
 
 static esp_err_t i2c_master_init(void)
 {
@@ -212,10 +230,16 @@ static esp_err_t max17048_init(max17048_gauge_t *gauge)
     for (int i = 0; i < MAX17048_INIT_RETRIES; i++) {
         float voltage_v = 0.0f;
         float soc_percent = 0.0f;
+        float crate_percent_per_hour = 0.0f;
+        uint16_t status_raw = 0;
         if (max17048_read_voltage_v(gauge, &voltage_v) == ESP_OK &&
-            max17048_read_soc_percent(gauge, &soc_percent) == ESP_OK) {
+            max17048_read_soc_percent(gauge, &soc_percent) == ESP_OK &&
+            max17048_read_crate_percent_per_hour(gauge, &crate_percent_per_hour) == ESP_OK &&
+            max17048_read_status_raw(gauge, &status_raw) == ESP_OK) {
             gauge->voltage_v = voltage_v;
             gauge->soc_percent = soc_percent;
+            gauge->crate_percent_per_hour = crate_percent_per_hour;
+            gauge->status_raw = status_raw;
             gauge->has_sample = true;
             gauge->present = true;
             return ESP_OK;
@@ -246,6 +270,20 @@ static esp_err_t max17048_read_soc_percent(max17048_gauge_t *gauge, float *soc_p
     return ESP_OK;
 }
 
+static esp_err_t max17048_read_crate_percent_per_hour(max17048_gauge_t *gauge, float *crate_percent_per_hour)
+{
+    uint16_t raw = 0;
+    ESP_RETURN_ON_ERROR(max17048_read_reg(gauge, MAX17048_REG_CRATE, &raw), TAG, "max17048 crate read failed");
+    *crate_percent_per_hour = (float)(int16_t)raw * MAX17048_CRATE_LSB_PERCENT_PER_HOUR;
+    return ESP_OK;
+}
+
+static esp_err_t max17048_read_status_raw(max17048_gauge_t *gauge, uint16_t *status_raw)
+{
+    ESP_RETURN_ON_ERROR(max17048_read_reg(gauge, MAX17048_REG_STATUS, status_raw), TAG, "max17048 status read failed");
+    return ESP_OK;
+}
+
 static bool max17048_sample_update(max17048_gauge_t *gauge, int64_t now_us)
 {
     if (!gauge->present) {
@@ -257,15 +295,25 @@ static bool max17048_sample_update(max17048_gauge_t *gauge, int64_t now_us)
 
     float voltage_v = 0.0f;
     float soc_percent = 0.0f;
+    float crate_percent_per_hour = 0.0f;
+    uint16_t status_raw = 0;
     if (max17048_read_voltage_v(gauge, &voltage_v) != ESP_OK) {
         return false;
     }
     if (max17048_read_soc_percent(gauge, &soc_percent) != ESP_OK) {
         return false;
     }
+    if (max17048_read_crate_percent_per_hour(gauge, &crate_percent_per_hour) != ESP_OK) {
+        return false;
+    }
+    if (max17048_read_status_raw(gauge, &status_raw) != ESP_OK) {
+        return false;
+    }
 
     gauge->voltage_v = voltage_v;
     gauge->soc_percent = soc_percent;
+    gauge->crate_percent_per_hour = crate_percent_per_hour;
+    gauge->status_raw = status_raw;
     gauge->has_sample = true;
     gauge->last_sample_us = now_us;
     return true;
@@ -373,11 +421,17 @@ static void font5x7_get(char c, uint8_t out[5])
     case '8': out[0] = 0x36; out[1] = 0x49; out[2] = 0x49; out[3] = 0x49; out[4] = 0x36; break;
     case '9': out[0] = 0x26; out[1] = 0x49; out[2] = 0x49; out[3] = 0x49; out[4] = 0x3E; break;
     case 'A': out[0] = 0x7E; out[1] = 0x11; out[2] = 0x11; out[3] = 0x11; out[4] = 0x7E; break;
+    case 'C': out[0] = 0x3E; out[1] = 0x41; out[2] = 0x41; out[3] = 0x41; out[4] = 0x22; break;
     case 'E': out[0] = 0x7F; out[1] = 0x49; out[2] = 0x49; out[3] = 0x49; out[4] = 0x41; break;
+    case 'H': out[0] = 0x7F; out[1] = 0x08; out[2] = 0x08; out[3] = 0x08; out[4] = 0x7F; break;
     case 'I': out[0] = 0x00; out[1] = 0x41; out[2] = 0x7F; out[3] = 0x41; out[4] = 0x00; break;
+    case 'K': out[0] = 0x7F; out[1] = 0x08; out[2] = 0x14; out[3] = 0x22; out[4] = 0x41; break;
+    case 'L': out[0] = 0x7F; out[1] = 0x40; out[2] = 0x40; out[3] = 0x40; out[4] = 0x40; break;
     case 'M': out[0] = 0x7F; out[1] = 0x02; out[2] = 0x04; out[3] = 0x02; out[4] = 0x7F; break;
     case 'N': out[0] = 0x7F; out[1] = 0x04; out[2] = 0x08; out[3] = 0x10; out[4] = 0x7F; break;
+    case 'O': out[0] = 0x3E; out[1] = 0x41; out[2] = 0x41; out[3] = 0x41; out[4] = 0x3E; break;
     case 'R': out[0] = 0x7F; out[1] = 0x09; out[2] = 0x19; out[3] = 0x29; out[4] = 0x46; break;
+    case 'S': out[0] = 0x26; out[1] = 0x49; out[2] = 0x49; out[3] = 0x49; out[4] = 0x32; break;
     case 'T': out[0] = 0x01; out[1] = 0x01; out[2] = 0x7F; out[3] = 0x01; out[4] = 0x01; break;
     case 'V': out[0] = 0x1F; out[1] = 0x20; out[2] = 0x40; out[3] = 0x20; out[4] = 0x1F; break;
     case 'a': out[0] = 0x20; out[1] = 0x54; out[2] = 0x54; out[3] = 0x54; out[4] = 0x78; break;
@@ -388,8 +442,10 @@ static void font5x7_get(char c, uint8_t out[5])
     case 'm': out[0] = 0x7C; out[1] = 0x04; out[2] = 0x18; out[3] = 0x04; out[4] = 0x78; break;
     case 'n': out[0] = 0x7C; out[1] = 0x04; out[2] = 0x04; out[3] = 0x04; out[4] = 0x78; break;
     case 'o': out[0] = 0x38; out[1] = 0x44; out[2] = 0x44; out[3] = 0x44; out[4] = 0x38; break;
+    case 'r': out[0] = 0x7C; out[1] = 0x08; out[2] = 0x04; out[3] = 0x04; out[4] = 0x08; break;
     case 's': out[0] = 0x48; out[1] = 0x54; out[2] = 0x54; out[3] = 0x54; out[4] = 0x24; break;
     case 't': out[0] = 0x04; out[1] = 0x04; out[2] = 0x3F; out[3] = 0x44; out[4] = 0x24; break;
+    case 'e': out[0] = 0x38; out[1] = 0x54; out[2] = 0x54; out[3] = 0x54; out[4] = 0x18; break;
     case ':': out[0] = 0x00; out[1] = 0x36; out[2] = 0x36; out[3] = 0x00; out[4] = 0x00; break;
     case '.': out[0] = 0x00; out[1] = 0x60; out[2] = 0x60; out[3] = 0x00; out[4] = 0x00; break;
     case '%': out[0] = 0x43; out[1] = 0x33; out[2] = 0x08; out[3] = 0x66; out[4] = 0x61; break;
@@ -420,21 +476,35 @@ static void fb_draw_text(int x, int y, const char *text)
     }
 }
 
-static void format_line_ma(char *buf, size_t len, const char *label, bool ok, float current_ma)
+static int fb_text_width(const char *text)
+{
+    return (int)strlen(text) * 6;
+}
+
+static int fb_text_right_x(const char *text)
+{
+    int x = SSD1306_WIDTH - fb_text_width(text);
+    if (x < 0) {
+        x = 0;
+    }
+    return x;
+}
+
+static void format_value_ma(char *buf, size_t len, bool ok, float current_ma)
 {
     if (ok) {
-        snprintf(buf, len, "%s:%8.2f mA", label, current_ma);
+        snprintf(buf, len, "%8.2f", current_ma);
     } else {
-        snprintf(buf, len, "%s:    ERR", label);
+        snprintf(buf, len, "    ERR");
     }
 }
 
-static void format_line_mah(char *buf, size_t len, const char *label, bool ok, float total_mah)
+static void format_value_mah(char *buf, size_t len, bool ok, float total_mah)
 {
     if (ok) {
-        snprintf(buf, len, "%sT:%8.2f mAh", label, total_mah);
+        snprintf(buf, len, "%8.2f", total_mah);
     } else {
-        snprintf(buf, len, "%sT:   ERR", label);
+        snprintf(buf, len, "   ERR");
     }
 }
 
@@ -465,6 +535,41 @@ static void format_line_battery(char *buf, size_t len, bool ok, float voltage_v,
     }
 }
 
+static const char *max17048_status_abbrev(uint16_t status_raw)
+{
+    uint8_t flags = (uint8_t)(status_raw & 0x3F);
+    if (flags & MAX17048_STATUS_RI) {
+        return "RI";
+    }
+    if (flags & MAX17048_STATUS_VR) {
+        return "VR";
+    }
+    if (flags & MAX17048_STATUS_VL) {
+        return "VL";
+    }
+    if (flags & MAX17048_STATUS_VH) {
+        return "VH";
+    }
+    if (flags & MAX17048_STATUS_SL) {
+        return "SL";
+    }
+    if (flags & MAX17048_STATUS_SC) {
+        return "SC";
+    }
+    return "OK";
+}
+
+static void format_line_battery_extra(char *left, size_t left_len, char *right, size_t right_len, bool ok, float crate_percent_per_hour, uint16_t status_raw)
+{
+    if (ok) {
+        snprintf(left, left_len, "crate:%6.2f", crate_percent_per_hour);
+        snprintf(right, right_len, "st:%s", max17048_status_abbrev(status_raw));
+    } else {
+        snprintf(left, left_len, "crate: ERR");
+        snprintf(right, right_len, "st: ERR");
+    }
+}
+
 void app_main(void)
 {
     bool oled_ok = false;
@@ -473,6 +578,8 @@ void app_main(void)
     char line3[24] = {0};
     char line4[24] = {0};
     char line5[24] = {0};
+    char line6_left[16] = {0};
+    char line6_right[16] = {0};
     int64_t next_oled_update_us = 0;
 
     ESP_ERROR_CHECK(i2c_master_init());
@@ -552,18 +659,32 @@ void app_main(void)
 
         if (oled_ok && now >= next_oled_update_us) {
             next_oled_update_us = now + OLED_REFRESH_INTERVAL_US;
-            format_line_ma(line1, sizeof(line1), INA1_PREFIX, s_sensors[0].has_sample, s_sensors[0].current_ma);
-            format_line_mah(line2, sizeof(line2), INA1_PREFIX, s_sensors[0].has_sample, s_sensors[0].total_mah);
-            format_line_ma(line3, sizeof(line3), INA2_PREFIX, s_sensors[1].has_sample, s_sensors[1].current_ma);
-            format_line_mah(line4, sizeof(line4), INA2_PREFIX, s_sensors[1].has_sample, s_sensors[1].total_mah);
+            format_value_ma(line1, sizeof(line1), s_sensors[0].has_sample, s_sensors[0].current_ma);
+            format_value_mah(line2, sizeof(line2), s_sensors[0].has_sample, s_sensors[0].total_mah);
+            format_value_ma(line3, sizeof(line3), s_sensors[1].has_sample, s_sensors[1].current_ma);
+            format_value_mah(line4, sizeof(line4), s_sensors[1].has_sample, s_sensors[1].total_mah);
             format_line_battery(line5, sizeof(line5), s_battery.has_sample, s_battery.voltage_v, s_battery.soc_percent);
+            format_line_battery_extra(
+                line6_left, sizeof(line6_left),
+                line6_right, sizeof(line6_right),
+                s_battery.has_sample, s_battery.crate_percent_per_hour, s_battery.status_raw);
 
             memset(s_fb, 0, sizeof(s_fb));
-            fb_draw_text(0, 0, line1);
-            fb_draw_text(0, 14, line2);
-            fb_draw_text(0, 28, line3);
-            fb_draw_text(0, 42, line4);
-            fb_draw_text(0, 56, line5);
+            fb_draw_text(0, 0, "ina1:");
+            fb_draw_text(INA_VALUE_X, 0, line1);
+            fb_draw_text(INA_UNIT_X, 0, "mA");
+            fb_draw_text(0, OLED_LINE_STEP * 1, "ina1T:");
+            fb_draw_text(INA_VALUE_X, OLED_LINE_STEP * 1, line2);
+            fb_draw_text(INA_UNIT_X, OLED_LINE_STEP * 1, "mAh");
+            fb_draw_text(0, OLED_LINE_STEP * 2, "ina2:");
+            fb_draw_text(INA_VALUE_X, OLED_LINE_STEP * 2, line3);
+            fb_draw_text(INA_UNIT_X, OLED_LINE_STEP * 2, "mA");
+            fb_draw_text(0, OLED_LINE_STEP * 3, "ina2T:");
+            fb_draw_text(INA_VALUE_X, OLED_LINE_STEP * 3, line4);
+            fb_draw_text(INA_UNIT_X, OLED_LINE_STEP * 3, "mAh");
+            fb_draw_text(0, OLED_LINE_STEP * 4, line5);
+            fb_draw_text(0, OLED_LINE_STEP * 5, line6_left);
+            fb_draw_text(fb_text_right_x(line6_right), OLED_LINE_STEP * 5, line6_right);
             if (ssd1306_refresh_pages(0, SSD1306_PAGES - 1) != ESP_OK) {
                 oled_ok = false;
                 ESP_LOGW(TAG, "fallo escribiendo OLED, continuo solo por serie");
