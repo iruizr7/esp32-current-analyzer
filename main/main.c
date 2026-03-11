@@ -17,6 +17,7 @@
 #include "ssd1306.h"
 
 static const char *TAG = APP_LOG_TAG;
+static const int64_t BATTERY_TELEPLOT_INTERVAL_US = 5000000;
 
 static ina219_sensor_t s_sensors[] = {
     {.address = INA219_ADDR_1, .label = INA1_PREFIX},
@@ -37,6 +38,7 @@ void app_main(void)
     char line6_left[16] = {0};
     char line6_right[16] = {0};
     int64_t next_oled_update_us = 0;
+    int64_t next_battery_teleplot_us = 0;
 
     ESP_ERROR_CHECK(i2c_bus_init());
     i2c_bus_scan();
@@ -111,6 +113,14 @@ void app_main(void)
             print_teleplot_total(&s_sensors[1]);
             s_sensors[1].last_emit_total_mah = s_sensors[1].total_mah;
             s_sensors[1].has_emitted_total = true;
+        }
+
+        if (next_battery_teleplot_us == 0) {
+            next_battery_teleplot_us = now + BATTERY_TELEPLOT_INTERVAL_US;
+        } else if (now >= next_battery_teleplot_us) {
+            print_teleplot_battery_voltage(s_battery.has_sample, s_battery.voltage_v);
+            print_teleplot_battery_soc(s_battery.has_sample, s_battery.soc_percent);
+            next_battery_teleplot_us = now + BATTERY_TELEPLOT_INTERVAL_US;
         }
 
         if (oled_ok && now >= next_oled_update_us) {

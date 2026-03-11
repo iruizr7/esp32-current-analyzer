@@ -65,6 +65,24 @@ void print_teleplot_total(const ina219_sensor_t *sensor)
     }
 }
 
+void print_teleplot_battery_voltage(bool ok, float voltage_v)
+{
+    if (ok) {
+        printf(">battV:%.3f\n", voltage_v);
+    } else {
+        printf(">battV:nan\n");
+    }
+}
+
+void print_teleplot_battery_soc(bool ok, float soc_percent)
+{
+    if (ok) {
+        printf(">batSOC:%.2f\n", soc_percent);
+    } else {
+        printf(">batSOC:nan\n");
+    }
+}
+
 void format_line_battery(char *buf, size_t len, bool ok, float voltage_v, float soc_percent)
 {
     if (ok) {
