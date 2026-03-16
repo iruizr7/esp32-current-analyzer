@@ -15,10 +15,6 @@ typedef struct {
     float current_ma;
     float total_mah;
     int64_t last_sample_us;
-    float last_emit_current_ma;
-    float last_emit_total_mah;
-    bool has_emitted_current;
-    bool has_emitted_total;
 } ina219_sensor_t;
 
 esp_err_t ina219_init(ina219_sensor_t *sensor);

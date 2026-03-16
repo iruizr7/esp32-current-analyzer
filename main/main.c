@@ -1,7 +1,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <math.h>
 
 #include "app_config.h"
 #include "esp_err.h"
@@ -17,7 +16,6 @@
 #include "ssd1306.h"
 
 static const char *TAG = APP_LOG_TAG;
-static const int64_t BATTERY_TELEPLOT_INTERVAL_US = 5000000;
 
 static ina219_sensor_t s_sensors[] = {
     {.address = INA219_ADDR_1, .label = INA1_PREFIX},
@@ -38,7 +36,7 @@ void app_main(void)
     char line6_left[16] = {0};
     char line6_right[16] = {0};
     int64_t next_oled_update_us = 0;
-    int64_t next_battery_teleplot_us = 0;
+    int64_t next_teleplot_report_us = 0;
 
     ESP_ERROR_CHECK(i2c_bus_init());
     i2c_bus_scan();
@@ -68,59 +66,22 @@ void app_main(void)
         max17048_retry_if_needed(&s_battery, now);
 
         bool sampled_any = false;
-        bool emit1_current = false;
-        bool emit1_total = false;
-        bool emit2_current = false;
-        bool emit2_total = false;
 
         bool s1 = ina219_sample_update(&s_sensors[0], now);
         bool s2 = ina219_sample_update(&s_sensors[1], now);
         bool sb = max17048_sample_update(&s_battery, now);
         sampled_any = s1 || s2 || sb;
 
-        if (s1) {
-            if (!s_sensors[0].has_emitted_current ||
-                fabsf(s_sensors[0].current_ma - s_sensors[0].last_emit_current_ma) > 0.0f) {
-                emit1_current = true;
-            }
-            emit1_total = true;
-        }
-
-        if (s2) {
-            if (!s_sensors[1].has_emitted_current ||
-                fabsf(s_sensors[1].current_ma - s_sensors[1].last_emit_current_ma) > 0.0f) {
-                emit2_current = true;
-            }
-            emit2_total = true;
-        }
-
-        if (emit1_current) {
+        if (next_teleplot_report_us == 0) {
+            next_teleplot_report_us = now + TELEPLOT_REPORT_INTERVAL_US;
+        } else if (now >= next_teleplot_report_us) {
             print_teleplot_current(&s_sensors[0]);
-            s_sensors[0].last_emit_current_ma = s_sensors[0].current_ma;
-            s_sensors[0].has_emitted_current = true;
-        }
-        if (emit1_total) {
             print_teleplot_total(&s_sensors[0]);
-            s_sensors[0].last_emit_total_mah = s_sensors[0].total_mah;
-            s_sensors[0].has_emitted_total = true;
-        }
-        if (emit2_current) {
             print_teleplot_current(&s_sensors[1]);
-            s_sensors[1].last_emit_current_ma = s_sensors[1].current_ma;
-            s_sensors[1].has_emitted_current = true;
-        }
-        if (emit2_total) {
             print_teleplot_total(&s_sensors[1]);
-            s_sensors[1].last_emit_total_mah = s_sensors[1].total_mah;
-            s_sensors[1].has_emitted_total = true;
-        }
-
-        if (next_battery_teleplot_us == 0) {
-            next_battery_teleplot_us = now + BATTERY_TELEPLOT_INTERVAL_US;
-        } else if (now >= next_battery_teleplot_us) {
             print_teleplot_battery_voltage(s_battery.has_sample, s_battery.voltage_v);
             print_teleplot_battery_soc(s_battery.has_sample, s_battery.soc_percent);
-            next_battery_teleplot_us = now + BATTERY_TELEPLOT_INTERVAL_US;
+            next_teleplot_report_us = now + TELEPLOT_REPORT_INTERVAL_US;
         }
 
         if (oled_ok && now >= next_oled_update_us) {
