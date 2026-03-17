@@ -8,14 +8,17 @@
 #include "freertos/task.h"
 
 #define MAX17048_REG_VCELL 0x02
+#define MAX17048_REG_MODE 0x06
 #define MAX17048_REG_SOC 0x04
 #define MAX17048_REG_CRATE 0x16
 #define MAX17048_REG_STATUS 0x1A
+#define MAX17048_MODE_QUICKSTART 0x4000
 #define MAX17048_CRATE_LSB_PERCENT_PER_HOUR 0.208f
 
 static const char *TAG = APP_LOG_TAG;
 
 static esp_err_t max17048_read_reg(max17048_gauge_t *gauge, uint8_t reg, uint16_t *value);
+static esp_err_t max17048_write_reg(max17048_gauge_t *gauge, uint8_t reg, uint16_t value);
 static esp_err_t max17048_read_voltage_v(max17048_gauge_t *gauge, float *voltage_v);
 static esp_err_t max17048_read_soc_percent(max17048_gauge_t *gauge, float *soc_percent);
 static esp_err_t max17048_read_crate_percent_per_hour(max17048_gauge_t *gauge, float *crate_percent_per_hour);
@@ -30,6 +33,21 @@ static esp_err_t max17048_read_reg(max17048_gauge_t *gauge, uint8_t reg, uint16_
         "max17048 read reg 0x%02X failed",
         reg);
     *value = (uint16_t)((rx[0] << 8) | rx[1]);
+    return ESP_OK;
+}
+
+static esp_err_t max17048_write_reg(max17048_gauge_t *gauge, uint8_t reg, uint16_t value)
+{
+    uint8_t tx[3] = {
+        reg,
+        (uint8_t)(value >> 8),
+        (uint8_t)(value & 0xFF),
+    };
+    ESP_RETURN_ON_ERROR(
+        i2c_master_transmit(gauge->dev, tx, sizeof(tx), 50),
+        TAG,
+        "max17048 write reg 0x%02X failed",
+        reg);
     return ESP_OK;
 }
 
@@ -99,6 +117,31 @@ esp_err_t max17048_init(max17048_gauge_t *gauge)
     gauge->present = false;
     gauge->has_sample = false;
     return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t max17048_quickstart(max17048_gauge_t *gauge)
+{
+    if (gauge == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (gauge->dev == NULL) {
+        ESP_RETURN_ON_ERROR(max17048_init(gauge), TAG, "max17048 quickstart init failed");
+    }
+
+    ESP_RETURN_ON_ERROR(
+        max17048_write_reg(gauge, MAX17048_REG_MODE, MAX17048_MODE_QUICKSTART),
+        TAG,
+        "max17048 quickstart failed");
+
+    gauge->present = true;
+    gauge->has_sample = false;
+    gauge->voltage_v = 0.0f;
+    gauge->soc_percent = 0.0f;
+    gauge->crate_percent_per_hour = 0.0f;
+    gauge->status_raw = 0;
+    gauge->last_sample_us = 0;
+    gauge->last_retry_us = 0;
+    return ESP_OK;
 }
 
 bool max17048_sample_update(max17048_gauge_t *gauge, int64_t now_us)

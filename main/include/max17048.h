@@ -27,5 +27,6 @@ typedef struct {
 } max17048_gauge_t;
 
 esp_err_t max17048_init(max17048_gauge_t *gauge);
+esp_err_t max17048_quickstart(max17048_gauge_t *gauge);
 bool max17048_sample_update(max17048_gauge_t *gauge, int64_t now_us);
 void max17048_retry_if_needed(max17048_gauge_t *gauge, int64_t now_us);

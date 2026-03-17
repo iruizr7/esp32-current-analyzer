@@ -1,6 +1,11 @@
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "app_config.h"
 #include "esp_err.h"
@@ -16,6 +21,9 @@
 #include "ssd1306.h"
 
 static const char *TAG = APP_LOG_TAG;
+static const char *QUICKSTART_CMD = "quickstart";
+
+#define SERIAL_COMMAND_MAX_LEN 32
 
 static ina219_sensor_t s_sensors[] = {
     {.address = INA219_ADDR_1, .label = INA1_PREFIX},
@@ -24,6 +32,91 @@ static ina219_sensor_t s_sensors[] = {
 static max17048_gauge_t s_battery = {
     .address = MAX17048_ADDR,
 };
+
+static void serial_command_init(void);
+static void handle_serial_commands(max17048_gauge_t *battery);
+static void process_serial_command(const char *command, max17048_gauge_t *battery);
+
+static void serial_command_init(void)
+{
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags < 0) {
+        ESP_LOGW(TAG, "no puedo leer flags de stdin, errno=%d", errno);
+        return;
+    }
+    if (fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ESP_LOGW(TAG, "no puedo poner stdin en no bloqueante, errno=%d", errno);
+        return;
+    }
+
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+static void process_serial_command(const char *command, max17048_gauge_t *battery)
+{
+    if (strcmp(command, QUICKSTART_CMD) == 0) {
+        printf("quickstart: recibido, enviando al MAX17048\r\n");
+        esp_err_t err = max17048_quickstart(battery);
+        if (err == ESP_OK) {
+            printf("quickstart: ok\r\n");
+        } else {
+            printf("quickstart: error %s\r\n", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    printf("comando desconocido: %s\r\n", command);
+}
+
+static void handle_serial_commands(max17048_gauge_t *battery)
+{
+    static char command[SERIAL_COMMAND_MAX_LEN];
+    static size_t command_len = 0;
+    static bool discarding = false;
+
+    while (true) {
+        char ch = '\0';
+        ssize_t read_len = read(STDIN_FILENO, &ch, 1);
+        if (read_len == 0) {
+            return;
+        }
+        if (read_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            ESP_LOGW(TAG, "fallo leyendo stdin, errno=%d", errno);
+            return;
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            if (discarding) {
+                discarding = false;
+                command_len = 0;
+                continue;
+            }
+            if (command_len == 0) {
+                continue;
+            }
+            command[command_len] = '\0';
+            process_serial_command(command, battery);
+            command_len = 0;
+            continue;
+        }
+
+        if (discarding) {
+            continue;
+        }
+        if ((command_len + 1) >= sizeof(command)) {
+            printf("comando demasiado largo\r\n");
+            command_len = 0;
+            discarding = true;
+            continue;
+        }
+
+        command[command_len++] = ch;
+    }
+}
 
 void app_main(void)
 {
@@ -37,6 +130,8 @@ void app_main(void)
     char line6_right[16] = {0};
     int64_t next_oled_update_us = 0;
     int64_t next_teleplot_report_us = 0;
+
+    serial_command_init();
 
     ESP_ERROR_CHECK(i2c_bus_init());
     i2c_bus_scan();
@@ -63,6 +158,7 @@ void app_main(void)
 
     while (true) {
         int64_t now = esp_timer_get_time();
+        handle_serial_commands(&s_battery);
         max17048_retry_if_needed(&s_battery, now);
 
         bool sampled_any = false;
